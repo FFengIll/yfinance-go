@@ -1,6 +1,7 @@
 package yfinance
 
 import (
+	"os"
 	"sync"
 )
 
@@ -37,7 +38,20 @@ func (c *Config) SetProxy(proxy string) {
 }
 
 // GetProxy gets the current proxy setting
+// Returns environment variable YFINANCE_PROXY if set, otherwise returns configured proxy
 func (c *Config) GetProxy() string {
+	// First check environment variable
+	if proxy := os.Getenv("YFINANCE_PROXY"); proxy != "" {
+		return proxy
+	}
+	// Then check HTTP_PROXY/HTTPS_PROXY
+	if proxy := os.Getenv("HTTPS_PROXY"); proxy != "" {
+		return proxy
+	}
+	if proxy := os.Getenv("HTTP_PROXY"); proxy != "" {
+		return proxy
+	}
+	// Finally return configured proxy
 	c.mu.RLock()
 	defer c.mu.RUnlock()
 	return c.Proxy

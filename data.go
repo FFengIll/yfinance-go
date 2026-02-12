@@ -49,17 +49,35 @@ type YfData struct {
 // utlsTransport is a custom transport that uses uTLS for TLS fingerprinting
 type utlsTransport struct {
 	originalTransport *http.Transport
+	proxyURL          *url.URL
 }
 
 // NewUtlsTransport creates a new uTLS transport
 func NewUtlsTransport() *utlsTransport {
+	return NewUtlsTransportWithProxy("")
+}
+
+// NewUtlsTransportWithProxy creates a new uTLS transport with proxy support
+func NewUtlsTransportWithProxy(proxy string) *utlsTransport {
+	var proxyURL *url.URL
+	if proxy != "" {
+		proxyURL, _ = url.Parse(proxy)
+	}
+
 	return &utlsTransport{
+		proxyURL: proxyURL,
 		originalTransport: &http.Transport{
 			MaxIdleConns:        10,
 			IdleConnTimeout:     30 * time.Second,
 			DisableCompression:  false,
 			TLSHandshakeTimeout: 10 * time.Second,
 			ForceAttemptHTTP2:   false, // Disable HTTP/2
+			Proxy: func(req *http.Request) (*url.URL, error) {
+				if proxyURL != nil {
+					return proxyURL, nil
+				}
+				return nil, nil
+			},
 			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
 				// Extract hostname for SNI
 				host, port, err := net.SplitHostPort(addr)
@@ -68,10 +86,44 @@ func NewUtlsTransport() *utlsTransport {
 					port = "443"
 				}
 
-				// Create TCP connection
-				tcpConn, err := net.DialTimeout(network, net.JoinHostPort(host, port), 10*time.Second)
-				if err != nil {
-					return nil, fmt.Errorf("dial error: %w", err)
+				var tcpConn net.Conn
+
+				// If using proxy, connect through it
+				if proxyURL != nil {
+					// Connect to proxy
+					proxyHost := proxyURL.Host
+					tcpConn, err = net.DialTimeout(network, proxyHost, 10*time.Second)
+					if err != nil {
+						return nil, fmt.Errorf("proxy dial error: %w", err)
+					}
+
+					// Send CONNECT request for HTTPS
+					connectReq := fmt.Sprintf("CONNECT %s HTTP/1.1\r\nHost: %s\r\n\r\n", net.JoinHostPort(host, port), host)
+					_, err = tcpConn.Write([]byte(connectReq))
+					if err != nil {
+						tcpConn.Close()
+						return nil, fmt.Errorf("proxy connect error: %w", err)
+					}
+
+					// Read proxy response
+					buf := make([]byte, 1024)
+					n, err := tcpConn.Read(buf)
+					if err != nil {
+						tcpConn.Close()
+						return nil, fmt.Errorf("proxy response error: %w", err)
+					}
+
+					// Check for 200 Connection established
+					if !bytes.Contains(buf[:n], []byte("200")) {
+						tcpConn.Close()
+						return nil, fmt.Errorf("proxy connection failed: %s", string(buf[:n]))
+					}
+				} else {
+					// Direct connection
+					tcpConn, err = net.DialTimeout(network, net.JoinHostPort(host, port), 10*time.Second)
+					if err != nil {
+						return nil, fmt.Errorf("dial error: %w", err)
+					}
 				}
 
 				// Create uTLS config - no ALPN means HTTP/1.1 only
@@ -119,7 +171,9 @@ func NewYfData() *YfData {
 	rand.Read(b)
 	sessionID := hex.EncodeToString(b)
 
-	transport := NewUtlsTransport()
+	// Get proxy from config (which checks environment variables)
+	proxy := GlobalConfig.GetProxy()
+	transport := NewUtlsTransportWithProxy(proxy)
 
 	yd := &YfData{
 		jar:            jar,
@@ -156,7 +210,9 @@ func NewYfDataWithClient(client *http.Client) *YfData {
 	b := make([]byte, 8)
 	rand.Read(b)
 
-	transport := NewUtlsTransport()
+	// Get proxy from config (which checks environment variables)
+	proxy := GlobalConfig.GetProxy()
+	transport := NewUtlsTransportWithProxy(proxy)
 
 	yd := &YfData{
 		client:         client,
@@ -185,6 +241,21 @@ func getCacheDir() string {
 	return cacheDir
 }
 
+// isValidCrumb checks if the crumb is valid (not an error page)
+func isValidCrumb(crumb string) bool {
+	if crumb == "" {
+		return false
+	}
+	// Check for common error responses
+	if strings.Contains(crumb, "<html>") ||
+		strings.Contains(crumb, "<!DOCTYPE") ||
+		strings.Contains(crumb, "Too Many Requests") ||
+		strings.Contains(crumb, "Yahoo") {
+		return false
+	}
+	return true
+}
+
 // loadCookieCache loads cached cookie from disk
 func (yd *YfData) loadCookieCache() bool {
 	if yd.cacheDir == "" {
@@ -204,6 +275,11 @@ func (yd *YfData) loadCookieCache() bool {
 
 	// Check if cache is expired
 	if time.Now().After(cache.Expiry) {
+		return false
+	}
+
+	// Validate crumb is not an error page
+	if !isValidCrumb(cache.Crumb) {
 		return false
 	}
 
@@ -446,6 +522,11 @@ func (yd *YfData) getCookieAndCrumb(ctx context.Context) (string, error) {
 
 	if err != nil {
 		return "", err
+	}
+
+	// Validate crumb before saving
+	if !isValidCrumb(crumb) {
+		return "", fmt.Errorf("invalid crumb received: %s", crumb)
 	}
 
 	yd.crumb = crumb

@@ -77,7 +77,7 @@ func ExampleTicker_GetQuote() {
 func ExampleTicker_GetFastInfo() {
 	ticker := yf.NewTicker("MSFT")
 
-	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
+	ctx, cancel := context.WithTimeout(context.Background(), 10*time.Second)
 	defer cancel()
 
 	info, err := ticker.GetFastInfo(ctx)
@@ -92,6 +92,7 @@ func ExampleTicker_GetFastInfo() {
 	fmt.Printf("Market Price: %.2f\n", info.MarketPrice)
 	fmt.Printf("52 Week High: %.2f\n", info.YearHigh)
 	fmt.Printf("52 Week Low: %.2f\n", info.YearLow)
+	// Output:
 }
 
 func ExampleTicker_GetInfo() {
