@@ -182,16 +182,16 @@ func (yd *YfData) getCookieAndCrumb(ctx context.Context) (string, error) {
 		return yd.crumb, nil
 	}
 
-	// First get cookie
-	if err := yd.getCookieBasic(ctx); err != nil {
+	// First get cookie (internal method, no lock needed)
+	if err := yd.getCookieBasicInternal(ctx); err != nil {
 		// Try CSRF strategy
 		if err := yd.getCookieCSRF(ctx); err != nil {
 			return "", err
 		}
 	}
 
-	// Then get crumb
-	crumb, err := yd.getCrumbBasic(ctx)
+	// Then get crumb (internal method, no lock needed)
+	crumb, err := yd.getCrumbBasicInternal(ctx)
 	if err != nil {
 		return "", err
 	}
@@ -200,18 +200,21 @@ func (yd *YfData) getCookieAndCrumb(ctx context.Context) (string, error) {
 	return crumb, nil
 }
 
-// getCookieBasic fetches cookie using basic strategy
-func (yd *YfData) getCookieBasic(ctx context.Context) error {
+// getUserAgent safely returns the user agent
+func (yd *YfData) getUserAgent() string {
+	yd.mu.Lock()
+	defer yd.mu.Unlock()
+	return yd.userAgent
+}
+
+// getCookieBasicInternal fetches cookie using basic strategy (must be called with lock held)
+func (yd *YfData) getCookieBasicInternal(ctx context.Context) error {
 	req, err := http.NewRequestWithContext(ctx, "GET", "https://fc.yahoo.com", nil)
 	if err != nil {
 		return err
 	}
 
-	yd.mu.Lock()
-	ua := yd.userAgent
-	yd.mu.Unlock()
-
-	req.Header.Set("User-Agent", ua)
+	req.Header.Set("User-Agent", yd.userAgent)
 	req.Header.Set("Accept", "*/*")
 
 	resp, err := yd.client.Do(req)
@@ -231,11 +234,73 @@ func (yd *YfData) getCookieBasic(ctx context.Context) error {
 	return nil
 }
 
+// getCookieBasic fetches cookie using basic strategy
+func (yd *YfData) getCookieBasic(ctx context.Context) error {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://fc.yahoo.com", nil)
+	if err != nil {
+		return err
+	}
+
+	req.Header.Set("User-Agent", yd.getUserAgent())
+	req.Header.Set("Accept", "*/*")
+
+	resp, err := yd.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	// Extract cookie from response
+	for _, cookie := range resp.Cookies() {
+		if cookie.Name == "A3" {
+			yd.mu.Lock()
+			yd.cookie = cookie.Value
+			yd.mu.Unlock()
+			return nil
+		}
+	}
+
+	return nil
+}
+
 // getCookieCSRF fetches cookie using CSRF strategy (fallback)
 func (yd *YfData) getCookieCSRF(ctx context.Context) error {
 	// This is a simplified implementation
 	// Full implementation would parse the consent form
 	return fmt.Errorf("CSRF cookie strategy not implemented")
+}
+
+// getCrumbBasicInternal fetches the crumb token (must be called with lock held)
+func (yd *YfData) getCrumbBasicInternal(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://query1.finance.yahoo.com/v1/test/getcrumb", nil)
+	if err != nil {
+		return "", err
+	}
+
+	req.Header.Set("User-Agent", yd.userAgent)
+	req.Header.Set("Accept", "*/*")
+
+	resp, err := yd.client.Do(req)
+	if err != nil {
+		return "", err
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode == 429 {
+		return "", NewYFRateLimitError()
+	}
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return "", err
+	}
+
+	crumb := string(body)
+	if crumb == "" || strings.Contains(crumb, "<html>") {
+		return "", fmt.Errorf("failed to get crumb")
+	}
+
+	return crumb, nil
 }
 
 // getCrumbBasic fetches the crumb token
@@ -245,11 +310,7 @@ func (yd *YfData) getCrumbBasic(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	yd.mu.Lock()
-	ua := yd.userAgent
-	yd.mu.Unlock()
-
-	req.Header.Set("User-Agent", ua)
+	req.Header.Set("User-Agent", yd.getUserAgent())
 	req.Header.Set("Accept", "*/*")
 
 	resp, err := yd.client.Do(req)
