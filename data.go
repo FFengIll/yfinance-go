@@ -3,45 +3,173 @@ package yfinance
 import (
 	"bytes"
 	"context"
+	"crypto/rand"
+	"encoding/hex"
 	"encoding/json"
 	"fmt"
 	"io"
-	"math/rand"
+	"math"
+	mrand "math/rand"
 	"net/http"
+	"net/http/cookiejar"
 	"net/url"
+	"os"
+	"path/filepath"
 	"strings"
 	"sync"
 	"time"
+
+	"golang.org/x/net/publicsuffix"
 )
+
+// CookieCache holds cached cookie data
+type CookieCache struct {
+	Cookie   string    `json:"cookie"`
+	Crumb    string    `json:"crumb"`
+	Expiry   time.Time `json:"expiry"`
+	Strategy string    `json:"strategy"`
+}
 
 // YfData handles HTTP communication with Yahoo Finance API
 type YfData struct {
 	client         *http.Client
+	jar            *cookiejar.Jar
 	crumb          string
 	cookie         string
 	cookieStrategy string
 	mu             sync.Mutex
 	userAgent      string
+	cacheDir       string
+	sessionID      string
 }
 
 // NewYfData creates a new YfData instance
 func NewYfData() *YfData {
-	yd := &YfData{
-		client:         &http.Client{Timeout: 30 * time.Second},
-		cookieStrategy: "basic",
-		userAgent:      UserAgents[rand.Intn(len(UserAgents))],
+	jar, err := cookiejar.New(&cookiejar.Options{
+		PublicSuffixList: publicsuffix.List,
+	})
+	if err != nil {
+		jar, _ = cookiejar.New(nil)
 	}
+
+	// Generate session ID
+	b := make([]byte, 8)
+	rand.Read(b)
+	sessionID := hex.EncodeToString(b)
+
+	yd := &YfData{
+		jar:            jar,
+		cookieStrategy: "basic",
+		userAgent:      UserAgents[mrand.Intn(len(UserAgents))],
+		sessionID:      sessionID,
+		cacheDir:       getCacheDir(),
+	}
+
+	yd.client = &http.Client{
+		Timeout: 30 * time.Second,
+		Jar:     jar,
+		Transport: &http.Transport{
+			MaxIdleConns:        10,
+			IdleConnTimeout:     30 * time.Second,
+			DisableCompression:  false,
+			TLSHandshakeTimeout: 10 * time.Second,
+		},
+	}
+
+	// Try to load cached cookie
+	yd.loadCookieCache()
+
 	return yd
 }
 
 // NewYfDataWithClient creates a new YfData instance with a custom HTTP client
 func NewYfDataWithClient(client *http.Client) *YfData {
+	jar, err := cookiejar.New(&cookiejar.Options{
+		PublicSuffixList: publicsuffix.List,
+	})
+	if err != nil {
+		jar, _ = cookiejar.New(nil)
+	}
+	client.Jar = jar
+
+	// Generate session ID
+	b := make([]byte, 8)
+	rand.Read(b)
+
 	yd := &YfData{
 		client:         client,
+		jar:            jar,
 		cookieStrategy: "basic",
-		userAgent:      UserAgents[rand.Intn(len(UserAgents))],
+		userAgent:      UserAgents[mrand.Intn(len(UserAgents))],
+		sessionID:      hex.EncodeToString(b),
+		cacheDir:       getCacheDir(),
 	}
+
+	// Try to load cached cookie
+	yd.loadCookieCache()
+
 	return yd
+}
+
+// getCacheDir returns the cache directory path
+func getCacheDir() string {
+	homeDir, err := os.UserHomeDir()
+	if err != nil {
+		return ""
+	}
+	cacheDir := filepath.Join(homeDir, ".cache", "yfinance-go")
+	os.MkdirAll(cacheDir, 0755)
+	return cacheDir
+}
+
+// loadCookieCache loads cached cookie from disk
+func (yd *YfData) loadCookieCache() bool {
+	if yd.cacheDir == "" {
+		return false
+	}
+
+	cacheFile := filepath.Join(yd.cacheDir, "cookie_cache.json")
+	data, err := os.ReadFile(cacheFile)
+	if err != nil {
+		return false
+	}
+
+	var cache CookieCache
+	if err := json.Unmarshal(data, &cache); err != nil {
+		return false
+	}
+
+	// Check if cache is expired
+	if time.Now().After(cache.Expiry) {
+		return false
+	}
+
+	yd.cookie = cache.Cookie
+	yd.crumb = cache.Crumb
+	yd.cookieStrategy = cache.Strategy
+	return true
+}
+
+// saveCookieCache saves cookie to disk
+func (yd *YfData) saveCookieCache() error {
+	if yd.cacheDir == "" {
+		return nil
+	}
+
+	cache := CookieCache{
+		Cookie:   yd.cookie,
+		Crumb:    yd.crumb,
+		Expiry:   time.Now().Add(24 * time.Hour), // Cache for 24 hours
+		Strategy: yd.cookieStrategy,
+	}
+
+	data, err := json.Marshal(cache)
+	if err != nil {
+		return err
+	}
+
+	cacheFile := filepath.Join(yd.cacheDir, "cookie_cache.json")
+	return os.WriteFile(cacheFile, data, 0644)
 }
 
 // SetUserAgent sets a custom user agent
@@ -65,24 +193,39 @@ func (yd *YfData) Post(ctx context.Context, endpoint string, params map[string]s
 func (yd *YfData) makeRequest(ctx context.Context, method, endpoint string, params map[string]string, body interface{}) (*http.Response, error) {
 	var lastErr error
 	retries := GlobalConfig.GetRetries()
+	if retries == 0 {
+		retries = 3
+	}
 
 	for attempt := 0; attempt <= retries; attempt++ {
 		resp, err := yd.doRequest(ctx, method, endpoint, params, body)
 		if err != nil {
 			lastErr = err
 			if IsTransientError(err) && attempt < retries {
-				time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+				backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				time.Sleep(backoff)
 				continue
 			}
 			return nil, err
 		}
 
-		// Handle rate limiting
+		// Handle rate limiting with strategy switch
 		if resp.StatusCode == 429 {
 			resp.Body.Close()
 			lastErr = NewYFRateLimitError()
+
+			// Switch cookie strategy and retry
+			yd.switchCookieStrategy()
+
 			if attempt < retries {
-				time.Sleep(time.Duration(1<<uint(attempt)) * time.Second)
+				backoff := time.Duration(math.Pow(2, float64(attempt))) * time.Second
+				if backoff > 30*time.Second {
+					backoff = 30 * time.Second
+				}
+				time.Sleep(backoff)
 				continue
 			}
 			return nil, lastErr
@@ -91,16 +234,40 @@ func (yd *YfData) makeRequest(ctx context.Context, method, endpoint string, para
 		// Handle cookie consent redirect
 		if yd.isConsentURL(resp.Request.URL.String()) {
 			resp.Body.Close()
-			if err := yd.acceptConsent(ctx, endpoint); err != nil {
+			if err := yd.acceptConsent(ctx); err != nil {
 				return nil, err
 			}
 			continue
+		}
+
+		// Handle 401/403 - might need new cookie
+		if resp.StatusCode == 401 || resp.StatusCode == 403 {
+			resp.Body.Close()
+			yd.ResetCrumb()
+			if attempt < retries {
+				continue
+			}
+			return nil, fmt.Errorf("authentication failed: %d", resp.StatusCode)
 		}
 
 		return resp, nil
 	}
 
 	return nil, lastErr
+}
+
+// switchCookieStrategy toggles between basic and csrf strategies
+func (yd *YfData) switchCookieStrategy() {
+	yd.mu.Lock()
+	defer yd.mu.Unlock()
+
+	if yd.cookieStrategy == "basic" {
+		yd.cookieStrategy = "csrf"
+	} else {
+		yd.cookieStrategy = "basic"
+	}
+	yd.crumb = ""
+	yd.cookie = ""
 }
 
 // doRequest executes a single HTTP request
@@ -146,16 +313,8 @@ func (yd *YfData) doRequest(ctx context.Context, method, endpoint string, params
 		return nil, fmt.Errorf("failed to create request: %w", err)
 	}
 
-	// Set headers
-	yd.mu.Lock()
-	ua := yd.userAgent
-	yd.mu.Unlock()
-
-	req.Header.Set("User-Agent", ua)
-	req.Header.Set("Accept", "application/json")
-	if body != nil {
-		req.Header.Set("Content-Type", "application/json")
-	}
+	// Set browser-like headers (thread-safe)
+	yd.setBrowserHeadersSafe(req)
 
 	// Set proxy if configured
 	proxy := GlobalConfig.GetProxy()
@@ -163,8 +322,8 @@ func (yd *YfData) doRequest(ctx context.Context, method, endpoint string, params
 		proxyURL, err := url.Parse(proxy)
 		if err == nil {
 			yd.mu.Lock()
-			yd.client.Transport = &http.Transport{
-				Proxy: http.ProxyURL(proxyURL),
+			if t, ok := yd.client.Transport.(*http.Transport); ok {
+				t.Proxy = http.ProxyURL(proxyURL)
 			}
 			yd.mu.Unlock()
 		}
@@ -173,38 +332,91 @@ func (yd *YfData) doRequest(ctx context.Context, method, endpoint string, params
 	return yd.client.Do(req)
 }
 
+// getUserAgentSafe returns user agent without lock (for internal use)
+func (yd *YfData) getUserAgentSafe() string {
+	return yd.userAgent
+}
+
+// setBrowserHeadersSafe sets headers with lock protection
+func (yd *YfData) setBrowserHeadersSafe(req *http.Request) {
+	yd.mu.Lock()
+	ua := yd.userAgent
+	yd.mu.Unlock()
+
+	yd.setBrowserHeadersWithUA(req, ua)
+}
+
+// setBrowserHeaders sets realistic browser headers (must be called with lock held)
+func (yd *YfData) setBrowserHeaders(req *http.Request) {
+	yd.setBrowserHeadersWithUA(req, yd.userAgent)
+}
+
+// setBrowserHeadersWithUA sets headers with provided user agent
+func (yd *YfData) setBrowserHeadersWithUA(req *http.Request, ua string) {
+	req.Header.Set("User-Agent", ua)
+	req.Header.Set("Accept", "text/html,application/xhtml+xml,application/xml;q=0.9,image/avif,image/webp,image/apng,*/*;q=0.8")
+	req.Header.Set("Accept-Language", "en-US,en;q=0.9")
+	req.Header.Set("Accept-Encoding", "gzip, deflate, br")
+	req.Header.Set("Connection", "keep-alive")
+	req.Header.Set("Sec-Fetch-Dest", "document")
+	req.Header.Set("Sec-Fetch-Mode", "navigate")
+	req.Header.Set("Sec-Fetch-Site", "none")
+	req.Header.Set("Sec-Fetch-User", "?1")
+	req.Header.Set("Upgrade-Insecure-Requests", "1")
+	req.Header.Set("Cache-Control", "max-age=0")
+
+	if body := req.Body; body != nil {
+		req.Header.Set("Content-Type", "application/json")
+	}
+}
+
 // getCookieAndCrumb fetches and caches the cookie and crumb for authentication
 func (yd *YfData) getCookieAndCrumb(ctx context.Context) (string, error) {
 	yd.mu.Lock()
 	defer yd.mu.Unlock()
 
+	// Return cached crumb if available
 	if yd.crumb != "" {
 		return yd.crumb, nil
 	}
 
-	// First get cookie (internal method, no lock needed)
-	if err := yd.getCookieBasicInternal(ctx); err != nil {
-		// Try CSRF strategy
-		if err := yd.getCookieCSRF(ctx); err != nil {
-			return "", err
+	var crumb string
+	var err error
+
+	if yd.cookieStrategy == "csrf" {
+		crumb, err = yd.getCookieAndCrumbCSRFInternal(ctx)
+		if err != nil {
+			// Fall back to basic
+			yd.cookieStrategy = "basic"
+			crumb, err = yd.getCookieAndCrumbBasicInternal(ctx)
+		}
+	} else {
+		crumb, err = yd.getCookieAndCrumbBasicInternal(ctx)
+		if err != nil {
+			// Try CSRF as fallback
+			yd.cookieStrategy = "csrf"
+			crumb, err = yd.getCookieAndCrumbCSRFInternal(ctx)
 		}
 	}
 
-	// Then get crumb (internal method, no lock needed)
-	crumb, err := yd.getCrumbBasicInternal(ctx)
 	if err != nil {
 		return "", err
 	}
 
 	yd.crumb = crumb
+	yd.saveCookieCache()
 	return crumb, nil
 }
 
-// getUserAgent safely returns the user agent
-func (yd *YfData) getUserAgent() string {
-	yd.mu.Lock()
-	defer yd.mu.Unlock()
-	return yd.userAgent
+// getCookieAndCrumbBasicInternal gets cookie and crumb using basic strategy (must be called with lock held)
+func (yd *YfData) getCookieAndCrumbBasicInternal(ctx context.Context) (string, error) {
+	// Get cookie first
+	if err := yd.getCookieBasicInternal(ctx); err != nil {
+		return "", fmt.Errorf("failed to get cookie: %w", err)
+	}
+
+	// Then get crumb
+	return yd.getCrumbBasicInternal(ctx)
 }
 
 // getCookieBasicInternal fetches cookie using basic strategy (must be called with lock held)
@@ -214,8 +426,7 @@ func (yd *YfData) getCookieBasicInternal(ctx context.Context) error {
 		return err
 	}
 
-	req.Header.Set("User-Agent", yd.userAgent)
-	req.Header.Set("Accept", "*/*")
+	yd.setBrowserHeadersWithUA(req, yd.userAgent)
 
 	resp, err := yd.client.Do(req)
 	if err != nil {
@@ -223,7 +434,7 @@ func (yd *YfData) getCookieBasicInternal(ctx context.Context) error {
 	}
 	defer resp.Body.Close()
 
-	// Extract cookie from response
+	// Extract A3 cookie from response or jar
 	for _, cookie := range resp.Cookies() {
 		if cookie.Name == "A3" {
 			yd.cookie = cookie.Value
@@ -231,43 +442,16 @@ func (yd *YfData) getCookieBasicInternal(ctx context.Context) error {
 		}
 	}
 
-	return nil
-}
-
-// getCookieBasic fetches cookie using basic strategy
-func (yd *YfData) getCookieBasic(ctx context.Context) error {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://fc.yahoo.com", nil)
-	if err != nil {
-		return err
-	}
-
-	req.Header.Set("User-Agent", yd.getUserAgent())
-	req.Header.Set("Accept", "*/*")
-
-	resp, err := yd.client.Do(req)
-	if err != nil {
-		return err
-	}
-	defer resp.Body.Close()
-
-	// Extract cookie from response
-	for _, cookie := range resp.Cookies() {
+	// Check jar for yahoo.com cookies
+	yahooURL, _ := url.Parse("https://yahoo.com")
+	for _, cookie := range yd.jar.Cookies(yahooURL) {
 		if cookie.Name == "A3" {
-			yd.mu.Lock()
 			yd.cookie = cookie.Value
-			yd.mu.Unlock()
 			return nil
 		}
 	}
 
 	return nil
-}
-
-// getCookieCSRF fetches cookie using CSRF strategy (fallback)
-func (yd *YfData) getCookieCSRF(ctx context.Context) error {
-	// This is a simplified implementation
-	// Full implementation would parse the consent form
-	return fmt.Errorf("CSRF cookie strategy not implemented")
 }
 
 // getCrumbBasicInternal fetches the crumb token (must be called with lock held)
@@ -277,8 +461,7 @@ func (yd *YfData) getCrumbBasicInternal(ctx context.Context) (string, error) {
 		return "", err
 	}
 
-	req.Header.Set("User-Agent", yd.userAgent)
-	req.Header.Set("Accept", "*/*")
+	yd.setBrowserHeadersWithUA(req, yd.userAgent)
 
 	resp, err := yd.client.Do(req)
 	if err != nil {
@@ -296,22 +479,108 @@ func (yd *YfData) getCrumbBasicInternal(ctx context.Context) (string, error) {
 	}
 
 	crumb := string(body)
-	if crumb == "" || strings.Contains(crumb, "<html>") {
-		return "", fmt.Errorf("failed to get crumb")
+	if crumb == "" || strings.Contains(crumb, "<html>") || strings.Contains(crumb, "Too Many Requests") {
+		return "", fmt.Errorf("failed to get crumb: %s", crumb)
 	}
 
 	return crumb, nil
 }
 
-// getCrumbBasic fetches the crumb token
-func (yd *YfData) getCrumbBasic(ctx context.Context) (string, error) {
-	req, err := http.NewRequestWithContext(ctx, "GET", "https://query1.finance.yahoo.com/v1/test/getcrumb", nil)
+// getCookieAndCrumbCSRFInternal gets cookie and crumb using CSRF strategy (must be called with lock held)
+func (yd *YfData) getCookieAndCrumbCSRFInternal(ctx context.Context) (string, error) {
+	// Get cookie via consent flow
+	if err := yd.getCookieCSRFInternal(ctx); err != nil {
+		return "", err
+	}
+
+	// Get crumb from query2
+	return yd.getCrumbCSRFInternal(ctx)
+}
+
+// getCookieCSRFInternal fetches cookie using CSRF/consent strategy (must be called with lock held)
+func (yd *YfData) getCookieCSRFInternal(ctx context.Context) error {
+	// Step 1: Get consent page
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://guce.yahoo.com/consent", nil)
+	if err != nil {
+		return err
+	}
+	yd.setBrowserHeadersWithUA(req, yd.userAgent)
+
+	resp, err := yd.client.Do(req)
+	if err != nil {
+		return err
+	}
+	defer resp.Body.Close()
+
+	body, err := io.ReadAll(resp.Body)
+	if err != nil {
+		return err
+	}
+
+	htmlBody := string(body)
+
+	// Extract csrfToken
+	csrfToken := extractInputValue(htmlBody, "csrfToken")
+	if csrfToken == "" {
+		return fmt.Errorf("failed to find csrfToken")
+	}
+
+	// Extract sessionId
+	sessionId := extractInputValue(htmlBody, "sessionId")
+	if sessionId == "" {
+		// Use our generated session ID
+		sessionId = yd.sessionID
+	}
+
+	// Step 2: Submit consent form
+	formData := url.Values{}
+	formData.Set("agree", "agree")
+	formData.Set("consentUUID", "default")
+	formData.Set("sessionId", sessionId)
+	formData.Set("csrfToken", csrfToken)
+	formData.Set("originalDoneUrl", "https://finance.yahoo.com/")
+	formData.Set("namespace", "yahoo")
+
+	consentURL := fmt.Sprintf("https://consent.yahoo.com/v2/collectConsent?sessionId=%s", sessionId)
+	req2, err := http.NewRequestWithContext(ctx, "POST", consentURL, strings.NewReader(formData.Encode()))
+	if err != nil {
+		return err
+	}
+	yd.setBrowserHeadersWithUA(req2, yd.userAgent)
+	req2.Header.Set("Content-Type", "application/x-www-form-urlencoded")
+
+	resp2, err := yd.client.Do(req2)
+	if err != nil {
+		return err
+	}
+	resp2.Body.Close()
+
+	// Step 3: Copy consent
+	copyURL := fmt.Sprintf("https://guce.yahoo.com/copyConsent?sessionId=%s", sessionId)
+	req3, err := http.NewRequestWithContext(ctx, "GET", copyURL, nil)
+	if err != nil {
+		return err
+	}
+	yd.setBrowserHeadersWithUA(req3, yd.userAgent)
+
+	resp3, err := yd.client.Do(req3)
+	if err != nil {
+		return err
+	}
+	resp3.Body.Close()
+
+	yd.cookie = "csrf-obtained"
+	return nil
+}
+
+// getCrumbCSRFInternal fetches crumb using query2 endpoint (must be called with lock held)
+func (yd *YfData) getCrumbCSRFInternal(ctx context.Context) (string, error) {
+	req, err := http.NewRequestWithContext(ctx, "GET", "https://query2.finance.yahoo.com/v1/test/getcrumb", nil)
 	if err != nil {
 		return "", err
 	}
 
-	req.Header.Set("User-Agent", yd.getUserAgent())
-	req.Header.Set("Accept", "*/*")
+	yd.setBrowserHeadersWithUA(req, yd.userAgent)
 
 	resp, err := yd.client.Do(req)
 	if err != nil {
@@ -329,11 +598,45 @@ func (yd *YfData) getCrumbBasic(ctx context.Context) (string, error) {
 	}
 
 	crumb := string(body)
-	if crumb == "" || strings.Contains(crumb, "<html>") {
-		return "", fmt.Errorf("failed to get crumb")
+	if crumb == "" || strings.Contains(crumb, "<html>") || strings.Contains(crumb, "Too Many Requests") {
+		return "", fmt.Errorf("failed to get crumb via CSRF: %s", crumb)
 	}
 
 	return crumb, nil
+}
+
+// extractInputValue extracts value from HTML input by name
+func extractInputValue(html, name string) string {
+	// Simple extraction - find input with given name
+	pattern := fmt.Sprintf(`name="%s"`, name)
+	idx := strings.Index(html, pattern)
+	if idx == -1 {
+		pattern = fmt.Sprintf(`name='%s'`, name)
+		idx = strings.Index(html, pattern)
+		if idx == -1 {
+			return ""
+		}
+	}
+
+	// Find value attribute
+	valueStart := strings.Index(html[idx:], `value="`)
+	if valueStart == -1 {
+		valueStart = strings.Index(html[idx:], `value='`)
+		if valueStart == -1 {
+			return ""
+		}
+	}
+	valueStart += idx + 7
+
+	valueEnd := strings.Index(html[valueStart:], `"`)
+	if valueEnd == -1 {
+		valueEnd = strings.Index(html[valueStart:], `'`)
+		if valueEnd == -1 {
+			return ""
+		}
+	}
+
+	return html[valueStart : valueStart+valueEnd]
 }
 
 // isConsentURL checks if the URL is a consent page
@@ -345,13 +648,16 @@ func (yd *YfData) isConsentURL(urlStr string) bool {
 	return strings.HasSuffix(parsed.Hostname(), "consent.yahoo.com")
 }
 
-// acceptConsent handles the consent form
-func (yd *YfData) acceptConsent(ctx context.Context, originalURL string) error {
-	// Simplified implementation - just reset and try again
+// acceptConsent handles the consent form when redirected
+func (yd *YfData) acceptConsent(ctx context.Context) error {
 	yd.mu.Lock()
+	defer yd.mu.Unlock()
+
+	// Reset and use CSRF strategy
 	yd.crumb = ""
 	yd.cookie = ""
-	yd.mu.Unlock()
+	yd.cookieStrategy = "csrf"
+
 	return nil
 }
 
@@ -390,4 +696,20 @@ func (yd *YfData) ResetCrumb() {
 	defer yd.mu.Unlock()
 	yd.crumb = ""
 	yd.cookie = ""
+}
+
+// ClearCache clears the cookie cache file
+func (yd *YfData) ClearCache() error {
+	yd.mu.Lock()
+	defer yd.mu.Unlock()
+
+	yd.crumb = ""
+	yd.cookie = ""
+
+	if yd.cacheDir == "" {
+		return nil
+	}
+
+	cacheFile := filepath.Join(yd.cacheDir, "cookie_cache.json")
+	return os.Remove(cacheFile)
 }
