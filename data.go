@@ -10,6 +10,7 @@ import (
 	"io"
 	"math"
 	mrand "math/rand"
+	"net"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
@@ -19,6 +20,7 @@ import (
 	"sync"
 	"time"
 
+	utls "github.com/refraction-networking/utls"
 	"golang.org/x/net/publicsuffix"
 )
 
@@ -41,6 +43,66 @@ type YfData struct {
 	userAgent      string
 	cacheDir       string
 	sessionID      string
+	transport      *utlsTransport
+}
+
+// utlsTransport is a custom transport that uses uTLS for TLS fingerprinting
+type utlsTransport struct {
+	originalTransport *http.Transport
+}
+
+// NewUtlsTransport creates a new uTLS transport
+func NewUtlsTransport() *utlsTransport {
+	return &utlsTransport{
+		originalTransport: &http.Transport{
+			MaxIdleConns:        10,
+			IdleConnTimeout:     30 * time.Second,
+			DisableCompression:  false,
+			TLSHandshakeTimeout: 10 * time.Second,
+			ForceAttemptHTTP2:   false, // Disable HTTP/2
+			DialTLSContext: func(ctx context.Context, network, addr string) (net.Conn, error) {
+				// Extract hostname for SNI
+				host, port, err := net.SplitHostPort(addr)
+				if err != nil {
+					host = addr
+					port = "443"
+				}
+
+				// Create TCP connection
+				tcpConn, err := net.DialTimeout(network, net.JoinHostPort(host, port), 10*time.Second)
+				if err != nil {
+					return nil, fmt.Errorf("dial error: %w", err)
+				}
+
+				// Create uTLS config - no ALPN means HTTP/1.1 only
+				config := &utls.Config{
+					ServerName:         host,
+					InsecureSkipVerify: false,
+				}
+
+				// Use randomized fingerprint without ALPN to force HTTP/1.1
+				tlsConn := utls.UClient(tcpConn, config, utls.HelloRandomizedNoALPN)
+
+				// Handshake
+				if err := tlsConn.Handshake(); err != nil {
+					tcpConn.Close()
+					return nil, fmt.Errorf("TLS handshake error: %w", err)
+				}
+
+				return tlsConn, nil
+			},
+		},
+	}
+}
+
+// RoundTrip implements http.RoundTripper
+func (t *utlsTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.originalTransport.RoundTrip(req)
+}
+
+// CloseIdleConnections closes idle connections
+func (t *utlsTransport) CloseIdleConnections() {
+	t.originalTransport.CloseIdleConnections()
 }
 
 // NewYfData creates a new YfData instance
@@ -57,23 +119,21 @@ func NewYfData() *YfData {
 	rand.Read(b)
 	sessionID := hex.EncodeToString(b)
 
+	transport := NewUtlsTransport()
+
 	yd := &YfData{
 		jar:            jar,
 		cookieStrategy: "basic",
 		userAgent:      UserAgents[mrand.Intn(len(UserAgents))],
 		sessionID:      sessionID,
 		cacheDir:       getCacheDir(),
+		transport:      transport,
 	}
 
 	yd.client = &http.Client{
-		Timeout: 30 * time.Second,
-		Jar:     jar,
-		Transport: &http.Transport{
-			MaxIdleConns:        10,
-			IdleConnTimeout:     30 * time.Second,
-			DisableCompression:  false,
-			TLSHandshakeTimeout: 10 * time.Second,
-		},
+		Timeout:   30 * time.Second,
+		Jar:       jar,
+		Transport: transport,
 	}
 
 	// Try to load cached cookie
@@ -96,6 +156,8 @@ func NewYfDataWithClient(client *http.Client) *YfData {
 	b := make([]byte, 8)
 	rand.Read(b)
 
+	transport := NewUtlsTransport()
+
 	yd := &YfData{
 		client:         client,
 		jar:            jar,
@@ -103,6 +165,7 @@ func NewYfDataWithClient(client *http.Client) *YfData {
 		userAgent:      UserAgents[mrand.Intn(len(UserAgents))],
 		sessionID:      hex.EncodeToString(b),
 		cacheDir:       getCacheDir(),
+		transport:      transport,
 	}
 
 	// Try to load cached cookie
@@ -316,25 +379,7 @@ func (yd *YfData) doRequest(ctx context.Context, method, endpoint string, params
 	// Set browser-like headers (thread-safe)
 	yd.setBrowserHeadersSafe(req)
 
-	// Set proxy if configured
-	proxy := GlobalConfig.GetProxy()
-	if proxy != "" {
-		proxyURL, err := url.Parse(proxy)
-		if err == nil {
-			yd.mu.Lock()
-			if t, ok := yd.client.Transport.(*http.Transport); ok {
-				t.Proxy = http.ProxyURL(proxyURL)
-			}
-			yd.mu.Unlock()
-		}
-	}
-
 	return yd.client.Do(req)
-}
-
-// getUserAgentSafe returns user agent without lock (for internal use)
-func (yd *YfData) getUserAgentSafe() string {
-	return yd.userAgent
 }
 
 // setBrowserHeadersSafe sets headers with lock protection
